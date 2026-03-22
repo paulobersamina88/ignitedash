@@ -1,18 +1,19 @@
-# IMDO Google Form Response Dashboard - V2
+# IMDO Prioritization Dashboard
 
-This version presents the Google Form responses in a style closer to the Google Forms summary view, while removing respondent names and emails for a more professional presentation.
-
-## Main improvements
-- Google Form-style pie charts and bar charts
-- Anonymized response IDs instead of names
-- Summary of justification responses using:
-  - general response themes
-  - frequent keywords
-- Summary of expected benefits responses
-- Clean anonymized export
+This package contains:
+- `app.py` - Streamlit dashboard with automatic cleaning, anonymization, and prioritization
+- `sample_data.csv` - cleaned dataset based on the latest uploaded Google Form results
+- `raw_uploaded_result.csv` - direct encoded version of the uploaded result for reference
+- `requirements.txt`
 
 ## Run
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+## What changed
+- removes garbage/test entries automatically
+- hides names/emails in the dashboard
+- adds IMDO priority scoring and recommendation tags
+- keeps Google Form style summary charts
