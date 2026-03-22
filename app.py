@@ -1,28 +1,21 @@
 
-import io
 from pathlib import Path
+from collections import Counter
+import re
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-st.set_page_config(page_title="IMDO GForm Project Proposal Dashboard", layout="wide")
+st.set_page_config(page_title="IMDO Google Form Response Dashboard", layout="wide")
 
 # -------------------------------------------------------
-# Helpers
+# Config / aliases
 # -------------------------------------------------------
-INVALID_TOKENS = {
-    "", ".", "n/a", "na", "none", "nil", "ndjd", "jdjd", "jnsnd",
-    "ndndn", "trial", "project title"
-}
-
-COLUMN_ALIASES = {
+FIELD_MAP = {
     "timestamp": "Timestamp",
-    "full_name": "Full Name (optional)",
-    "position": "Position / Designation",
     "unit": "College/ Office / Unit",
     "building": "Building or Facility Assigned / Located",
-    "email": "Email Address:",
     "project_title": "1. Proposed Project Title:",
     "project_location": "2. Location of the Proposed Project",
     "project_type": "3. Type of Project",
@@ -37,369 +30,369 @@ COLUMN_ALIASES = {
     "docs": "Do u currently have existing documents related to the project?",
 }
 
-DISPLAY_NAMES = {
-    "Timestamp": "Timestamp",
-    "Full Name (optional)": "Proponent",
-    "Position / Designation": "Position",
-    "College/ Office / Unit": "Unit",
-    "Building or Facility Assigned / Located": "Assigned Building",
-    "Email Address:": "Email",
-    "1. Proposed Project Title:": "Project Title",
-    "2. Location of the Proposed Project": "Project Location",
-    "3. Type of Project": "Project Category",
-    "Project Description /Rationale": "Description / Rationale",
-    'Choose the Main Purpose of your "Project Proposal" by clicking one of the boxes below': "Main Purpose",
-    "Justification (Why is this project needed? what problem or need will it address?)": "Justification",
-    "Expected Benefits (Example: improved learning space, safety, increased capacity, etc.)": "Expected Benefits",
-    "Urgency Level": "Urgency",
-    "1. Type of Project": "Work Type",
-    "2. Area for Construction / Renovation / Improvement": "Area / Quantity",
-    "3. Mode of Procurement": "Procurement Mode",
-    "Do u currently have existing documents related to the project?": "Existing Documents",
-}
-
-PRIORITY_ORDER = [
-    "High Priority (within 1 year)",
-    "Medium Priority (1-3 years)",
-    "Low Priority (3+ years)"
+TEXT_FIELDS = [
+    FIELD_MAP["description"],
+    FIELD_MAP["justification"],
+    FIELD_MAP["benefits"],
 ]
 
-def normalize_text(val):
+STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "are", "was", "were", "will", "have",
+    "has", "had", "into", "their", "there", "than", "then", "them", "they", "its", "it's",
+    "our", "your", "you", "but", "not", "all", "can", "may", "due", "per", "also", "any",
+    "very", "more", "most", "much", "need", "needs", "needed", "project", "proposal", "proposed",
+    "space", "area", "building", "facility", "improve", "improved", "improvement", "renovation",
+    "repair", "maintenance", "construction", "new", "office", "college", "unit", "address",
+    "provide", "provides", "providing", "support", "through", "during", "because", "about",
+    "would", "should", "being", "such", "like", "etc", "within", "year", "years", "one",
+    "two", "three", "across", "toward", "towards", "based", "related", "currently", "existing",
+    "none", "yet", "n", "a", "an", "of", "to", "in", "on", "at", "by", "is", "it", "as",
+    "be", "or", "if", "we", "do", "u", "up", "out", "no", "na", "n/a"
+}
+
+CATEGORY_COLORS = None  # keep default plotly palette
+
+# -------------------------------------------------------
+# Helpers
+# -------------------------------------------------------
+def load_data(uploaded, sample_path: Path) -> pd.DataFrame:
+    if uploaded is not None:
+        return pd.read_csv(uploaded)
+    if sample_path.exists():
+        return pd.read_csv(sample_path)
+    return pd.DataFrame()
+
+def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    for col in FIELD_MAP.values():
+        if col not in df.columns:
+            df[col] = ""
+    return df
+
+def clean_text(val) -> str:
     if pd.isna(val):
         return ""
     return str(val).strip()
 
-def is_invalid(val: str) -> bool:
-    v = normalize_text(val).lower()
-    return v in INVALID_TOKENS
+def split_multi_value(series: pd.Series) -> pd.Series:
+    vals = []
+    for v in series.fillna("").astype(str):
+        parts = [p.strip() for p in re.split(r"[;,/]\s*|\n+", v) if p.strip()]
+        if not parts and v.strip():
+            parts = [v.strip()]
+        vals.extend(parts)
+    return pd.Series(vals, dtype="object")
 
-def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # trim column names
-    df.columns = [str(c).strip() for c in df.columns]
-
-    # keep only known columns where possible
-    for _, col in COLUMN_ALIASES.items():
-        if col not in df.columns:
-            df[col] = ""
-
-    # normalize text columns
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = ensure_columns(df)
     for c in df.columns:
         if df[c].dtype == object:
-            df[c] = df[c].astype(str).fillna("").str.strip()
+            df[c] = df[c].fillna("").astype(str).str.strip()
 
-    # timestamp
-    if "Timestamp" in df.columns:
-        df["Timestamp_dt"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-        df["Date Submitted"] = df["Timestamp_dt"].dt.date.astype("string")
+    df["Timestamp_dt"] = pd.to_datetime(df[FIELD_MAP["timestamp"]], errors="coerce")
+    df["Response Date"] = df["Timestamp_dt"].dt.strftime("%Y-%m-%d")
+
+    # anonymized ID for professional presentation
+    df = df.sort_values("Timestamp_dt", kind="stable").reset_index(drop=True)
+    df["Response ID"] = [f"PRJ-{i+1:03d}" for i in range(len(df))]
+    return df
+
+def pie_chart_from_counts(counts_df: pd.DataFrame, names_col: str, values_col: str, title: str):
+    if counts_df.empty:
+        st.info("No responses available for this item.")
+        return
+    fig = px.pie(counts_df, names=names_col, values=values_col, title=title, hole=0.0)
+    fig.update_traces(textposition="inside", textinfo="percent+label")
+    st.plotly_chart(fig, use_container_width=True)
+
+def bar_chart_from_counts(counts_df: pd.DataFrame, x_col: str, y_col: str, title: str, horizontal: bool = False):
+    if counts_df.empty:
+        st.info("No responses available for this item.")
+        return
+    if horizontal:
+        fig = px.bar(counts_df, x=y_col, y=x_col, orientation="h", title=title, text=y_col)
     else:
-        df["Timestamp_dt"] = pd.NaT
-        df["Date Submitted"] = ""
+        fig = px.bar(counts_df, x=x_col, y=y_col, title=title, text=y_col)
+    st.plotly_chart(fig, use_container_width=True)
 
-    # consolidated project title
-    df["Project Title Clean"] = df["1. Proposed Project Title:"].where(
-        ~df["1. Proposed Project Title:"].apply(is_invalid),
-        "Untitled Proposal"
-    )
-
-    # data quality scoring
-    required_fields = [
-        "1. Proposed Project Title:",
-        "College/ Office / Unit",
-        "2. Location of the Proposed Project",
-        "3. Type of Project",
-        "Project Description /Rationale",
-        "Urgency Level",
-    ]
-
-    def missing_count(row):
-        count = 0
-        for c in required_fields:
-            if is_invalid(row.get(c, "")):
-                count += 1
-        return count
-
-    def quality_flag(row):
-        mc = missing_count(row)
-        title = normalize_text(row.get("1. Proposed Project Title:", "")).lower()
-        desc = normalize_text(row.get("Project Description /Rationale", "")).lower()
-        if mc >= 3 or title in INVALID_TOKENS or desc in INVALID_TOKENS:
-            return "Needs Review"
-        if mc >= 1:
-            return "Partially Complete"
-        return "Ready"
-
-    df["Missing Required Fields"] = df.apply(missing_count, axis=1)
-    df["Submission Quality"] = df.apply(quality_flag, axis=1)
-
-    # document count
-    def count_docs(x):
-        x = normalize_text(x)
-        if not x or is_invalid(x) or x.lower() == "none yet":
-            return 0
-        return len([p for p in x.split(",") if p.strip()])
-
-    df["Existing Document Count"] = df["Do u currently have existing documents related to the project?"].apply(count_docs)
-
-    # simple score for initial prioritization
-    urgency_score_map = {
-        "High Priority (within 1 year)": 3,
-        "Medium Priority (1-3 years)": 2,
-        "Low Priority (3+ years)": 1,
-    }
-    doc_bonus = df["Existing Document Count"].clip(upper=3)
-    quality_bonus = df["Submission Quality"].map({"Ready": 2, "Partially Complete": 1, "Needs Review": 0}).fillna(0)
-    df["Priority Score"] = (
-        df["Urgency Level"].map(urgency_score_map).fillna(0) * 4
-        + quality_bonus
-        + doc_bonus
-    )
-
-    # label rows that look like tests/placeholders
-    def suspicious(row):
-        suspicious_words = {"trial", "ndjd", "jdjd", "ndndn", ".", "none"}
-        fields = [
-            normalize_text(row.get("1. Proposed Project Title:", "")).lower(),
-            normalize_text(row.get("Project Description /Rationale", "")).lower(),
-            normalize_text(row.get("College/ Office / Unit", "")).lower(),
-        ]
-        return any(f in suspicious_words for f in fields)
-
-    df["Possible Test Entry"] = df.apply(suspicious, axis=1)
-
-    # nicer names for view
-    df_view = df.rename(columns=DISPLAY_NAMES)
-    return df_view
-
-def metric_card(label, value):
-    st.metric(label, value)
-
-def safe_multiselect(label, series):
-    opts = sorted([x for x in series.dropna().astype(str).unique().tolist() if x.strip()])
-    return st.multiselect(label, opts)
-
-# -------------------------------------------------------
-# UI
-# -------------------------------------------------------
-st.title("IMDO Project Proposal Dashboard")
-st.caption("For Google Form responses on proposed infrastructure, renovation, repair, and facility projects.")
-
-with st.expander("How to use this dashboard", expanded=False):
+def show_question_header(title: str, count: int):
     st.markdown(
-        """
-        1. Upload the CSV export from your Google Form responses, or use the built-in sample file.  
-        2. Filter by unit, location, project type, urgency, procurement mode, and submission quality.  
-        3. Review the priority table, document readiness, and entries that may need validation.  
-        """
+        f"""
+        <div style="background:#673ab7;color:white;padding:12px 16px;border-radius:12px 12px 0 0;
+                    font-size:1.35rem;font-weight:700;margin-top:8px;">
+            {title}
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+    st.markdown(f"**{count} responses**")
+
+def response_list_block(title: str, series: pd.Series, max_items: int = 12):
+    cleaned = [clean_text(x) for x in series if clean_text(x)]
+    st.subheader(title)
+    if not cleaned:
+        st.info("No responses available.")
+        return
+    for item in cleaned[:max_items]:
+        st.markdown(
+            f"""
+            <div style="background:#f5f5f5;border-radius:8px;padding:12px 14px;margin-bottom:10px;
+                        border-left:4px solid #673ab7;">
+                {item}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    if len(cleaned) > max_items:
+        st.caption(f"Showing {max_items} of {len(cleaned)} responses.")
+
+def extract_keywords(series: pd.Series, top_n: int = 12):
+    all_text = " ".join([clean_text(x).lower() for x in series if clean_text(x)])
+    tokens = re.findall(r"[a-zA-Z][a-zA-Z\-]{2,}", all_text)
+    tokens = [t for t in tokens if t not in STOPWORDS and not t.isdigit()]
+    counts = Counter(tokens)
+    data = pd.DataFrame(counts.most_common(top_n), columns=["Keyword", "Count"])
+    return data
+
+def theme_summary(series: pd.Series):
+    theme_rules = {
+        "Safety / Hazard": ["safety", "hazard", "danger", "unsafe", "fire", "leak", "flood", "risk", "security"],
+        "Accreditation / Compliance": ["aacup", "copc", "ched", "arta", "rqAT".lower(), "compliance", "levelling", "audit"],
+        "Learning / Laboratory Upgrade": ["laboratory", "lab", "classroom", "learning", "instruction", "equipment", "training"],
+        "Utilities / Power / Water": ["power", "electrical", "water", "generator", "solar", "lighting", "drainage"],
+        "Space / Capacity Need": ["space", "capacity", "extension", "room", "office", "center", "venue"],
+        "Rehabilitation / Deterioration": ["rehabilitation", "repair", "renovation", "deterioration", "damaged", "ceiling", "roof"],
+    }
+
+    counts = Counter()
+    clean_responses = [clean_text(x).lower() for x in series if clean_text(x)]
+    for text in clean_responses:
+        matched = False
+        for theme, keys in theme_rules.items():
+            if any(k in text for k in keys):
+                counts[theme] += 1
+                matched = True
+        if not matched:
+            counts["Other / Specific Unit Need"] += 1
+
+    df = pd.DataFrame(counts.items(), columns=["Theme", "Count"]).sort_values("Count", ascending=False)
+    return df
+
+def categorical_counts(series: pd.Series, split_values: bool = False):
+    if split_values:
+        s = split_multi_value(series)
+    else:
+        s = series.fillna("").astype(str).str.strip()
+        s = s[s != ""]
+    if s.empty:
+        return pd.DataFrame(columns=["Response", "Count"])
+    out = s.value_counts().reset_index()
+    out.columns = ["Response", "Count"]
+    return out
+
+def anonymized_table(df: pd.DataFrame):
+    wanted = [
+        "Response ID",
+        FIELD_MAP["project_title"],
+        FIELD_MAP["unit"],
+        FIELD_MAP["project_location"],
+        FIELD_MAP["project_type"],
+        FIELD_MAP["urgency"],
+        FIELD_MAP["purpose"],
+        FIELD_MAP["procurement"],
+        FIELD_MAP["docs"],
+    ]
+    cols = [c for c in wanted if c in df.columns]
+    renamed = {
+        "Response ID": "Response ID",
+        FIELD_MAP["project_title"]: "Project Title",
+        FIELD_MAP["unit"]: "Unit / Office",
+        FIELD_MAP["project_location"]: "Project Location",
+        FIELD_MAP["project_type"]: "Type of Project",
+        FIELD_MAP["urgency"]: "Urgency",
+        FIELD_MAP["purpose"]: "Purpose / Justification Category",
+        FIELD_MAP["procurement"]: "Procurement Mode",
+        FIELD_MAP["docs"]: "Existing Documents",
+    }
+    view = df[cols].rename(columns=renamed)
+    st.dataframe(view, use_container_width=True)
+
+# -------------------------------------------------------
+# Main UI
+# -------------------------------------------------------
+st.title("IMDO Google Form Response Dashboard")
+st.caption("Google Form-style presentation of project proposal responses with anonymized, professional summaries.")
 
 sample_path = Path(__file__).parent / "sample_data.csv"
-
-left, right = st.columns([1, 1])
-with left:
+with st.sidebar:
+    st.header("Data Source")
     use_sample = st.checkbox("Use built-in sample data", value=True)
-with right:
     uploaded = st.file_uploader("Upload Google Form CSV", type=["csv"])
+    st.divider()
+    st.header("Filters")
+    hide_blank = st.checkbox("Hide blank / empty responses in charts", value=True)
 
 df_raw = None
 if uploaded is not None:
     df_raw = pd.read_csv(uploaded)
-elif use_sample and sample_path.exists():
-    df_raw = pd.read_csv(sample_path)
+elif use_sample:
+    df_raw = load_data(None, sample_path)
 
-if df_raw is None:
-    st.warning("Please upload a CSV file or enable the sample data.")
+if df_raw is None or df_raw.empty:
+    st.warning("Please upload your Google Form CSV or keep the sample data enabled.")
     st.stop()
 
-df = clean_dataframe(df_raw)
+df = normalize_df(df_raw)
 
-# -------------------------------------------------------
-# Filters
-# -------------------------------------------------------
-st.sidebar.header("Filters")
+# sidebar filters excluding names
+units = sorted([x for x in df[FIELD_MAP["unit"]].dropna().astype(str).unique().tolist() if x.strip()])
+types = sorted([x for x in df[FIELD_MAP["project_type"]].dropna().astype(str).unique().tolist() if x.strip()])
+urgencies = sorted([x for x in df[FIELD_MAP["urgency"]].dropna().astype(str).unique().tolist() if x.strip()])
 
-units = safe_multiselect("Unit / College / Office", df["Unit"] if "Unit" in df.columns else pd.Series(dtype=str))
-locations = safe_multiselect("Project Location", df["Project Location"] if "Project Location" in df.columns else pd.Series(dtype=str))
-categories = safe_multiselect("Project Category", df["Project Category"] if "Project Category" in df.columns else pd.Series(dtype=str))
-urgency = st.sidebar.multiselect("Urgency", PRIORITY_ORDER, default=PRIORITY_ORDER)
-procurement = safe_multiselect("Procurement Mode", df["Procurement Mode"] if "Procurement Mode" in df.columns else pd.Series(dtype=str))
-quality = st.sidebar.multiselect(
-    "Submission Quality",
-    ["Ready", "Partially Complete", "Needs Review"],
-    default=["Ready", "Partially Complete", "Needs Review"]
-)
-hide_tests = st.sidebar.checkbox("Hide possible test / placeholder entries", value=True)
+with st.sidebar:
+    selected_units = st.multiselect("Unit / Office", units, default=units)
+    selected_types = st.multiselect("Type of Project", types, default=types)
+    selected_urgencies = st.multiselect("Urgency Level", urgencies, default=urgencies)
 
 filtered = df.copy()
-if units:
-    filtered = filtered[filtered["Unit"].isin(units)]
-if locations:
-    filtered = filtered[filtered["Project Location"].isin(locations)]
-if categories:
-    filtered = filtered[filtered["Project Category"].isin(categories)]
-if urgency:
-    filtered = filtered[filtered["Urgency"].isin(urgency)]
-if procurement:
-    filtered = filtered[filtered["Procurement Mode"].isin(procurement)]
-if quality:
-    filtered = filtered[filtered["Submission Quality"].isin(quality)]
-if hide_tests and "Possible Test Entry" in filtered.columns:
-    filtered = filtered[~filtered["Possible Test Entry"]]
+if selected_units:
+    filtered = filtered[filtered[FIELD_MAP["unit"]].isin(selected_units)]
+if selected_types:
+    filtered = filtered[filtered[FIELD_MAP["project_type"]].isin(selected_types)]
+if selected_urgencies:
+    filtered = filtered[filtered[FIELD_MAP["urgency"]].isin(selected_urgencies)]
 
-# -------------------------------------------------------
 # KPIs
-# -------------------------------------------------------
-c1, c2, c3, c4, c5 = st.columns(5)
-with c1:
-    metric_card("Total Proposals", int(len(filtered)))
-with c2:
-    metric_card("High Priority", int((filtered["Urgency"] == "High Priority (within 1 year)").sum()))
-with c3:
-    metric_card("Ready Submissions", int((filtered["Submission Quality"] == "Ready").sum()))
-with c4:
-    metric_card("Needs Review", int((filtered["Submission Quality"] == "Needs Review").sum()))
-with c5:
-    metric_card("With Existing Docs", int((filtered["Existing Document Count"] > 0).sum()))
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Total Responses", len(filtered))
+c2.metric("Unique Units", filtered[FIELD_MAP["unit"]].nunique())
+c3.metric("Project Types", filtered[FIELD_MAP["project_type"]].nunique())
+c4.metric("Urgency Levels Used", filtered[FIELD_MAP["urgency"]].nunique())
 
-# -------------------------------------------------------
-# Charts
-# -------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Prioritization", "Document Readiness", "Raw Data"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Google Form Summary",
+    "Text Response Summary",
+    "Anonymized Response List",
+    "Download"
+])
 
 with tab1:
-    row1_col1, row1_col2 = st.columns(2)
-    with row1_col1:
-        by_unit = filtered["Unit"].value_counts().reset_index()
-        by_unit.columns = ["Unit", "Count"]
-        if not by_unit.empty:
-            fig = px.bar(by_unit, x="Unit", y="Count", title="Projects by Unit / College / Office")
-            st.plotly_chart(fig, use_container_width=True)
+    show_question_header("A. Project Type Summary", len(filtered))
 
-    with row1_col2:
-        by_urg = filtered["Urgency"].value_counts().reindex(PRIORITY_ORDER, fill_value=0).reset_index()
-        by_urg.columns = ["Urgency", "Count"]
-        if not by_urg.empty:
-            fig = px.pie(by_urg, names="Urgency", values="Count", title="Urgency Distribution")
-            st.plotly_chart(fig, use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        counts = categorical_counts(filtered[FIELD_MAP["project_type"]])
+        pie_chart_from_counts(counts, "Response", "Count", "3. Type of Project")
 
-    row2_col1, row2_col2 = st.columns(2)
-    with row2_col1:
-        by_cat = filtered["Project Category"].value_counts().reset_index()
-        by_cat.columns = ["Project Category", "Count"]
-        if not by_cat.empty:
-            fig = px.bar(by_cat, x="Project Category", y="Count", title="Projects by Category")
-            st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        counts = categorical_counts(filtered[FIELD_MAP["urgency"]])
+        pie_chart_from_counts(counts, "Response", "Count", "Urgency Level")
 
-    with row2_col2:
-        by_proc = filtered["Procurement Mode"].value_counts().reset_index()
-        by_proc.columns = ["Procurement Mode", "Count"]
-        if not by_proc.empty:
-            fig = px.bar(by_proc, x="Procurement Mode", y="Count", title="Procurement Mode Distribution")
-            fig.update_layout(xaxis_tickangle=-20)
-            st.plotly_chart(fig, use_container_width=True)
+    st.divider()
+    show_question_header("B. Purpose / Justification Category", len(filtered))
+    purpose_counts = categorical_counts(filtered[FIELD_MAP["purpose"]])
+    bar_chart_from_counts(purpose_counts, "Response", "Count", 'Choose the Main Purpose of your "Project Proposal"', horizontal=True)
 
-    st.subheader("Quick Proposal Summary")
-    summary_cols = [
-        "Timestamp", "Proponent", "Position", "Unit", "Project Title", "Project Location",
-        "Project Category", "Urgency", "Submission Quality", "Existing Document Count"
-    ]
-    existing = [c for c in summary_cols if c in filtered.columns]
-    st.dataframe(filtered[existing].sort_values(by="Timestamp", ascending=False), use_container_width=True)
+    st.divider()
+    show_question_header("C. Procurement Mode", len(filtered))
+    procurement_counts = categorical_counts(filtered[FIELD_MAP["procurement"]])
+    pie_chart_from_counts(procurement_counts, "Response", "Count", "3. Mode of Procurement")
+
+    st.divider()
+    show_question_header("D. Existing Documents", len(filtered))
+    docs_counts = categorical_counts(filtered[FIELD_MAP["docs"]], split_values=True)
+    bar_chart_from_counts(docs_counts, "Response", "Count", "Existing Documents Mentioned", horizontal=True)
+
+    st.divider()
+    show_question_header("E. Unit / Office Distribution", len(filtered))
+    unit_counts = categorical_counts(filtered[FIELD_MAP["unit"]])
+    bar_chart_from_counts(unit_counts, "Response", "Count", "Responses by Unit / Office", horizontal=True)
 
 with tab2:
-    st.subheader("Initial Prioritization Matrix")
-    st.caption("Simple score based on urgency, submission quality, and presence of existing documents.")
+    show_question_header("C. Brief Description of the Proposed Project", len(filtered))
+    response_list_block("Project Description / Rationale", filtered[FIELD_MAP["description"]], max_items=10)
 
-    pr_cols = ["Project Title", "Unit", "Project Location", "Urgency", "Submission Quality", "Existing Documents", "Priority Score"]
-    if "Existing Documents" not in filtered.columns and "Do u currently have existing documents related to the project?" in filtered.columns:
-        filtered["Existing Documents"] = filtered["Do u currently have existing documents related to the project?"]
+    st.divider()
+    show_question_header("D. Summary of Justification Responses", len(filtered))
 
-    pr_existing = [c for c in pr_cols if c in filtered.columns]
-    pr_table = filtered[pr_existing].sort_values(by="Priority Score", ascending=False)
-    st.dataframe(pr_table, use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        theme_df = theme_summary(filtered[FIELD_MAP["justification"]])
+        bar_chart_from_counts(theme_df, "Theme", "Count", "General Themes from Justification Responses", horizontal=True)
 
-    scatter_df = filtered.copy()
-    urgency_num = scatter_df["Urgency"].map({
-        "High Priority (within 1 year)": 3,
-        "Medium Priority (1-3 years)": 2,
-        "Low Priority (3+ years)": 1,
-    }).fillna(0)
-    quality_num = scatter_df["Submission Quality"].map({"Ready": 3, "Partially Complete": 2, "Needs Review": 1}).fillna(0)
+    with col2:
+        keywords_df = extract_keywords(filtered[FIELD_MAP["justification"]], top_n=12)
+        bar_chart_from_counts(keywords_df, "Keyword", "Count", "Most Frequent Justification Keywords", horizontal=True)
 
-    scatter_df["Urgency Score"] = urgency_num
-    scatter_df["Readiness Score"] = quality_num
+    st.markdown("### Anonymized Justification Responses")
+    just_df = filtered[["Response ID", FIELD_MAP["project_title"], FIELD_MAP["justification"]]].copy()
+    just_df = just_df.rename(columns={
+        FIELD_MAP["project_title"]: "Project Title",
+        FIELD_MAP["justification"]: "Justification Response"
+    })
+    st.dataframe(just_df, use_container_width=True)
 
-    if not scatter_df.empty:
-        fig = px.scatter(
-            scatter_df,
-            x="Readiness Score",
-            y="Urgency Score",
-            size="Priority Score",
-            color="Unit",
-            hover_name="Project Title",
-            hover_data=["Project Location", "Procurement Mode"],
-            title="Urgency vs Submission Readiness"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    st.divider()
+    show_question_header("E. Summary of Expected Benefits Responses", len(filtered))
+
+    col1, col2 = st.columns(2)
+    with col1:
+        benefit_keywords = extract_keywords(filtered[FIELD_MAP["benefits"]], top_n=12)
+        bar_chart_from_counts(benefit_keywords, "Keyword", "Count", "Most Frequent Expected Benefit Keywords", horizontal=True)
+    with col2:
+        benefit_themes = theme_summary(filtered[FIELD_MAP["benefits"]])
+        bar_chart_from_counts(benefit_themes, "Theme", "Count", "General Themes from Expected Benefits", horizontal=True)
+
+    st.markdown("### Anonymized Expected Benefits Responses")
+    ben_df = filtered[["Response ID", FIELD_MAP["project_title"], FIELD_MAP["benefits"]]].copy()
+    ben_df = ben_df.rename(columns={
+        FIELD_MAP["project_title"]: "Project Title",
+        FIELD_MAP["benefits"]: "Expected Benefits Response"
+    })
+    st.dataframe(ben_df, use_container_width=True)
 
 with tab3:
-    st.subheader("Existing Document Readiness")
+    st.subheader("Anonymized Google Form Response Table")
+    st.caption("Names, email addresses, and designations are intentionally excluded for a more professional presentation.")
+    anonymized_table(filtered)
 
-    docs = filtered.groupby("Unit", dropna=False).agg(
-        proposals=("Project Title", "count"),
-        avg_docs=("Existing Document Count", "mean"),
-        ready=("Submission Quality", lambda s: (s == "Ready").sum()),
-        needs_review=("Submission Quality", lambda s: (s == "Needs Review").sum()),
-    ).reset_index()
-
-    if not docs.empty:
-        fig = px.bar(
-            docs,
-            x="Unit",
-            y=["ready", "needs_review"],
-            barmode="group",
-            title="Ready vs Needs Review by Unit"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-    review_cols = [
-        "Project Title", "Unit", "Proponent", "Urgency", "Submission Quality",
-        "Missing Required Fields", "Existing Documents", "Justification", "Expected Benefits"
-    ]
-    if "Existing Documents" not in filtered.columns and "Do u currently have existing documents related to the project?" in filtered.columns:
-        filtered["Existing Documents"] = filtered["Do u currently have existing documents related to the project?"]
-
-    review_existing = [c for c in review_cols if c in filtered.columns]
-    st.dataframe(
-        filtered[review_existing].sort_values(
-            by=["Submission Quality", "Missing Required Fields", "Urgency"],
-            ascending=[True, False, True]
-        ),
-        use_container_width=True
-    )
+    st.subheader("Project Titles and Locations")
+    title_view = filtered[["Response ID", FIELD_MAP["project_title"], FIELD_MAP["project_location"], FIELD_MAP["building"]]].rename(columns={
+        FIELD_MAP["project_title"]: "Project Title",
+        FIELD_MAP["project_location"]: "Project Location",
+        FIELD_MAP["building"]: "Building / Facility"
+    })
+    st.dataframe(title_view, use_container_width=True)
 
 with tab4:
-    st.subheader("Raw / Detailed Data")
+    st.subheader("Export Filtered, Anonymized Data")
+    export_cols = [
+        "Response ID",
+        "Response Date",
+        FIELD_MAP["unit"],
+        FIELD_MAP["building"],
+        FIELD_MAP["project_title"],
+        FIELD_MAP["project_location"],
+        FIELD_MAP["project_type"],
+        FIELD_MAP["description"],
+        FIELD_MAP["purpose"],
+        FIELD_MAP["justification"],
+        FIELD_MAP["benefits"],
+        FIELD_MAP["urgency"],
+        FIELD_MAP["type_detail"],
+        FIELD_MAP["area"],
+        FIELD_MAP["procurement"],
+        FIELD_MAP["docs"],
+    ]
+    export_cols = [c for c in export_cols if c in filtered.columns]
+    export_df = filtered[export_cols].copy()
+    st.dataframe(export_df, use_container_width=True)
 
-    keyword = st.text_input("Search keyword in title / description / justification")
-    raw = filtered.copy()
-
-    if keyword:
-        k = keyword.lower()
-        mask = (
-            raw["Project Title"].astype(str).str.lower().str.contains(k, na=False) |
-            raw["Description / Rationale"].astype(str).str.lower().str.contains(k, na=False) |
-            raw["Justification"].astype(str).str.lower().str.contains(k, na=False)
-        )
-        raw = raw[mask]
-
-    st.dataframe(raw, use_container_width=True)
-
-    csv_bytes = raw.to_csv(index=False).encode("utf-8")
+    csv_bytes = export_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "Download filtered data as CSV",
+        "Download anonymized filtered CSV",
         data=csv_bytes,
-        file_name="imdo_filtered_projects.csv",
+        file_name="imdo_gform_anonymized_summary.csv",
         mime="text/csv"
     )
